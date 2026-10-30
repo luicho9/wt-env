@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("WTENV_CONFIG_DIR", Path.home() / ".config/wtenv"))
+CONFIG_FILE = CONFIG_DIR / "config.env"
+BACKEND_OVERRIDES_FILE = CONFIG_DIR / "backend.env"
+STATE_DIR = Path(os.environ.get("WTENV_STATE_DIR", Path.home() / ".local/state/wtenv"))
+STATE_FILE = STATE_DIR / "envs.json"
+LOCK_FILE = STATE_DIR / "envs.lock"
+
+DEFAULTS = {
+    "WTENV_MAIN_CHECKOUT": str(Path.home() / "work/moxie-link"),
+    "WTENV_DB_CONTAINER": "emr-engine-database-1",
+    "WTENV_DB_SOURCE": "test",
+    "WTENV_TEMPLATE_DB": "wt_template",
+    "WTENV_NETWORK": "moxie_link_network",
+    "WTENV_IMAGE": "moxie-link-backend:local",
+    "WTENV_FRONTEND_PORT_BASE": "4100",
+    "WTENV_BACKEND_PORT_BASE": "4200",
+    "WTENV_LOGIN_EMAIL": "",
+    "WTENV_LOGIN_PASSWORD": "",
+    "WTENV_TS_AUTHKEY": "",
+    "WTENV_TS_IMAGE": "tailscale/tailscale:stable",
+}
+
+CELERY_QUEUES = (
+    "telehealth,authentication,notifications,users,patients,celery,encounters,"
+    "billing,billing_remit,insurances,note_assistance,ai_suggestions,pcc"
+)
+
+VITE_WRAPPER = """import base from "../vite.config.ts";
+
+const backend = process.env.WTENV_BACKEND_URL;
+const port = Number(process.env.WTENV_FRONTEND_PORT);
+const baseProxy = base.server?.proxy ?? {};
+
+export default {
+  ...base,
+  server: {
+    ...base.server,
+    host: true,
+    port,
+    strictPort: true,
+    allowedHosts: true,
+    proxy: {
+      ...baseProxy,
+      "/api": { ...baseProxy["/api"], target: backend },
+      "/media": { target: backend, changeOrigin: true },
+      "/health": { target: backend, changeOrigin: true },
+    },
+  },
+};
+"""
+
+
+def die(message, code=1):
+    print(f"wtenv: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def log(message):
+    print(f"==> {message}", flush=True)
+
+
+def parse_env_file(path):
+    values = {}
+    if not path.exists():
+        return values
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().removeprefix("export ").strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        else:
+            value = re.sub(r"\s+#.*$", "", value)
+        values[key] = value
+    return values
+
+
+def load_config():
+    config = dict(DEFAULTS)
+    config.update(parse_env_file(CONFIG_FILE))
+    for key in DEFAULTS:
+        if key in os.environ:
+            config[key] = os.environ[key]
+    return config
+
+
+def run(cmd, check=True, capture=False, **kwargs):
+    result = subprocess.run(cmd, text=True, capture_output=capture, **kwargs)
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() if capture else ""
+        die(f"command failed ({result.returncode}): {' '.join(cmd)}\n{detail}")
+    return result
+
+
+def docker(*args, check=True, capture=True):
+    return run(["docker", *args], check=check, capture=capture)
+
+
+@contextlib.contextmanager
+def state_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK_FILE, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
+def read_state():
+    if not STATE_FILE.exists():
+        return {}
+    return json.loads(STATE_FILE.read_text())
+
+
+def write_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.replace(STATE_FILE)
+
+
+def worktree_root(path):
+    result = run(["git", "-C", str(path), "rev-parse", "--show-toplevel"], check=False, capture=True)
+    if result.returncode != 0:
+        die(f"{path} is not inside a git worktree")
+    root = Path(result.stdout.strip())
+    if not (root / "backend/manage.py").exists() or not (root / "frontend/package.json").exists():
+        die(f"{root} does not look like a moxie-link checkout")
+    return root
+
+
+def slug_for(root):
+    return re.sub(r"[^a-z0-9]+", "-", root.name.lower()).strip("-")
+
+
+def port_free(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
+def allocate(config, root):
+    slug = slug_for(root)
+    with state_lock():
+        state = read_state()
+        entry = state.get(slug)
+        if entry and entry["path"] != str(root):
+            die(f"slug {slug} already belongs to {entry['path']}")
+        if not entry:
+            used = {e["index"] for e in state.values()}
+            frontend_base = int(config["WTENV_FRONTEND_PORT_BASE"])
+            backend_base = int(config["WTENV_BACKEND_PORT_BASE"])
+            for index in range(1, 100):
+                if index in used:
+                    continue
+                if port_free(frontend_base + index) and port_free(backend_base + index):
+                    break
+            else:
+                die("no free port slots left; run `wtenv prune` or `wtenv destroy` on an old env")
+            entry = {
+                "slug": slug,
+                "path": str(root),
+                "index": index,
+                "frontend_port": frontend_base + index,
+                "backend_port": backend_base + index,
+                "db": "wt_" + slug.replace("-", "_"),
+                "created_at": int(time.time()),
+            }
+            state[slug] = entry
+            write_state(state)
+        return entry
+
+
+def find_entry(root):
+    slug = slug_for(root)
+    entry = read_state().get(slug)
+    if not entry:
+        die(f"no env for {root.name}; run `wtenv up` first")
+    return entry
+
+
+def names(entry):
+    slug = entry["slug"]
+    return {
+        "app": f"wt-{slug}-app",
+        "redis": f"wt-{slug}-redis",
+        "celery": f"wt-{slug}-celery",
+        "ts": f"wt-{slug}-ts",
+    }
+
+
+def env_dir(entry):
+    path = STATE_DIR / entry["slug"]
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def tailnet_host():
+    result = run(["tailscale", "status", "--json"], check=False, capture=True)
+    if result.returncode != 0:
+        return None
+    with contextlib.suppress(ValueError, KeyError):
+        return json.loads(result.stdout)["Self"]["DNSName"].rstrip(".")
+    return None
+
+
+def ts_hostname(entry):
+    return f"wt-{entry['slug']}"[:63]
+
+
+def urls(config, entry):
+    host = tailnet_host()
+    frontend_port = entry["frontend_port"]
+    link = {
+        "app": f"http://localhost:{frontend_port}",
+        "api": f"http://localhost:{entry['backend_port']}",
+        "tailnet": None,
+        "tailnet_port": f"http://{host}:{frontend_port}" if host else None,
+        "tailnet_short": f"http://{host.split('.')[0]}:{frontend_port}" if host else None,
+    }
+    if host and config["WTENV_TS_AUTHKEY"]:
+        domain = host.split(".", 1)[1]
+        link["tailnet"] = f"https://{ts_hostname(entry)}.{domain}"
+    else:
+        link["tailnet"] = link["tailnet_port"]
+    return link
+
+
+def psql(config, sql, db="postgres", check=True):
+    base = parse_env_file(Path(config["WTENV_MAIN_CHECKOUT"]) / "backend/.env")
+    user = base.get("DATABASE_USER", "test")
+    return docker(
+        "exec", config["WTENV_DB_CONTAINER"], "psql", "-U", user, "-d", db, "-v", "ON_ERROR_STOP=1", "-Atc", sql,
+        check=check,
+    )
+
+
+def db_exists(config, name):
+    return psql(config, f"SELECT 1 FROM pg_database WHERE datname = '{name}'").stdout.strip() == "1"
+
+
+def build_template(config):
+    template = config["WTENV_TEMPLATE_DB"]
+    source = config["WTENV_DB_SOURCE"]
+    base = parse_env_file(Path(config["WTENV_MAIN_CHECKOUT"]) / "backend/.env")
+    user = base.get("DATABASE_USER", "test")
+    log(f"building template {template} from {source} (pg_dump | pg_restore, takes a minute)")
+    if db_exists(config, template):
+        psql(config, f"ALTER DATABASE {template} WITH is_template false")
+        psql(config, f"DROP DATABASE {template} WITH (FORCE)")
+    psql(config, f"CREATE DATABASE {template}")
+    pipeline = (
+        f"pg_dump -U {user} -Fc {source} | "
+        f"pg_restore -U {user} -d {template} --no-owner --no-privileges --exit-on-error"
+    )
+    result = docker("exec", config["WTENV_DB_CONTAINER"], "sh", "-c", pipeline, check=False, capture=False)
+    if result.returncode != 0:
+        die("template restore failed")
+    psql(config, f"ALTER DATABASE {template} WITH is_template true")
+    log(f"template {template} ready")
+
+
+def ensure_database(config, entry, reset=False):
+    template = config["WTENV_TEMPLATE_DB"]
+    if not db_exists(config, template):
+        build_template(config)
+    db = entry["db"]
+    if reset and db_exists(config, db):
+        log(f"dropping {db}")
+        psql(config, f"DROP DATABASE {db} WITH (FORCE)")
+    if not db_exists(config, db):
+        log(f"creating {db} from {template}")
+        psql(config, f"CREATE DATABASE {db} TEMPLATE {template}")
+
+
+def container_state(name):
+    result = docker("inspect", "-f", "{{.State.Status}}", name, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def labels(entry, role):
+    return ["--label", f"wtenv.slug={entry['slug']}", "--label", f"wtenv.role={role}"]
+
+
+def ensure_redis(config, entry):
+    name = names(entry)["redis"]
+    status = container_state(name)
+    if status == "running":
+        return
+    if status:
+        docker("rm", "-f", name)
+    log(f"starting {name}")
+    docker(
+        "run", "-d", "--name", name, "--network", config["WTENV_NETWORK"], "--restart", "unless-stopped",
+        *labels(entry, "redis"), "redis:7-alpine", "redis-server", "--save", "", "--appendonly", "no",
+    )
+
+
+def ensure_volume(config, name):
+    if docker("volume", "inspect", name, check=False).returncode == 0:
+        return
+    docker("volume", "create", "--label", "wtenv=1", name)
+    docker("run", "--rm", "-u", "0", "-v", f"{name}:/target", "--entrypoint", "chown", config["WTENV_IMAGE"],
+           "1000:1000", "/target")
+
+
+def venv_volume(root):
+    digest = hashlib.sha256((root / "backend/uv.lock").read_bytes()).hexdigest()[:12]
+    return f"wtenv-venv-{digest}"
+
+
+def backend_env(config, entry):
+    base = parse_env_file(Path(config["WTENV_MAIN_CHECKOUT"]) / "backend/.env")
+    base.setdefault("PCC_TENANT_KEY", "moxie")
+    base.update(parse_env_file(BACKEND_OVERRIDES_FILE))
+    redis = names(entry)["redis"]
+    frontend_port = entry["frontend_port"]
+    link = urls(config, entry)
+    origins = [f"http://localhost:{frontend_port}", f"http://127.0.0.1:{frontend_port}"]
+    origins += [url for key in ("tailnet", "tailnet_port", "tailnet_short") if (url := link[key])]
+    origins = list(dict.fromkeys(origins))
+    base.update({
+        "DEBUG": "True",
+        "DATABASE_NAME": entry["db"],
+        "DATABASE_HOST": "database",
+        "DATABASE_PORT": "5432",
+        "REDIS_HOST": redis,
+        "REDIS_PORT": "6379",
+        "REDIS_URL": f"redis://{redis}:6379/0",
+        "CELERY_BROKER_URL": f"redis://{redis}:6379/0",
+        "CELERY_RESULT_BACKEND": f"redis://{redis}:6379/0",
+        "ALLOWED_HOSTS": "*",
+        "CORS_ALLOWED_ORIGINS": ",".join(origins),
+        "CSRF_TRUSTED_ORIGINS": ",".join(origins),
+        "FRONTEND_URL": link["tailnet"] or link["app"],
+        "UV_LINK_MODE": "copy",
+        "UV_CACHE_DIR": "/uv-cache",
+        "UV_PROJECT_ENVIRONMENT": "/app/.venv",
+    })
+    path = env_dir(entry) / "backend.env"
+    path.write_text("".join(f"{k}={v}\n" for k, v in base.items() if "\n" not in v))
+    path.chmod(0o600)
+    return path
+
+
+def backend_run_args(config, entry, root, role):
+    venv = venv_volume(root)
+    ensure_volume(config, venv)
+    ensure_volume(config, "wtenv-uv-cache")
+    return [
+        "--network", config["WTENV_NETWORK"],
+        "--env-file", str(backend_env(config, entry)),
+        "-v", f"{root / 'backend'}:/app",
+        "-v", f"{venv}:/app/.venv",
+        "-v", "wtenv-uv-cache:/uv-cache",
+        "-w", "/app",
+        *labels(entry, role),
+    ]
+
+
+def sync_and_migrate(config, entry, root):
+    log("uv sync + migrate (output below)")
+    script = "uv sync --frozen --group test --quiet && python manage.py migrate --noinput"
+    args = backend_run_args(config, entry, root, "migrate")
+    result = run(["docker", "run", "--rm", *args, config["WTENV_IMAGE"], "sh", "-c", script], check=False)
+    if result.returncode != 0:
+        die("uv sync / migrate failed; fix the branch and rerun `wtenv up`")
+
+
+def start_backend(config, entry, root, recreate=False):
+    name = names(entry)["app"]
+    status = container_state(name)
+    if status == "running" and not recreate:
+        return
+    if status:
+        docker("rm", "-f", name)
+    log(f"starting {name} on :{entry['backend_port']}")
+    args = backend_run_args(config, entry, root, "app")
+    docker(
+        "run", "-d", "--name", name, "-p", f"{entry['backend_port']}:9000", *args,
+        config["WTENV_IMAGE"], "python", "manage.py", "runserver", "0.0.0.0:9000",
+    )
+
+
+def start_celery(config, entry, root, recreate=False):
+    name = names(entry)["celery"]
+    status = container_state(name)
+    if status == "running" and not recreate:
+        return
+    if status:
+        docker("rm", "-f", name)
+    log(f"starting {name}")
+    args = backend_run_args(config, entry, root, "celery")
+    docker(
+        "run", "-d", "--name", name, *args, config["WTENV_IMAGE"],
+        "celery", "-A", "src", "worker", "--loglevel=info", "--concurrency=2",
+        "-Q", CELERY_QUEUES, "--hostname", f"wt-{entry['slug']}@%h",
+    )
+
+
+def ensure_tailscale(config, entry):
+    if not config["WTENV_TS_AUTHKEY"]:
+        return
+    name = names(entry)["ts"]
+    status = container_state(name)
+    if status == "running":
+        return
+    if status:
+        docker("rm", "-f", name)
+    serve = {
+        "TCP": {"443": {"HTTPS": True}},
+        "Web": {
+            "${TS_CERT_DOMAIN}:443": {
+                "Handlers": {"/": {"Proxy": f"http://host.docker.internal:{entry['frontend_port']}"}},
+            },
+        },
+    }
+    directory = env_dir(entry)
+    (directory / "serve.json").write_text(json.dumps(serve, indent=2))
+    secrets = directory / "ts.env"
+    secrets.write_text(f"TS_AUTHKEY={config['WTENV_TS_AUTHKEY']}\n")
+    secrets.chmod(0o600)
+    log(f"starting {name} as {ts_hostname(entry)}")
+    docker(
+        "run", "-d", "--name", name, "--restart", "unless-stopped",
+        "--add-host", "host.docker.internal:host-gateway",
+        "--env-file", str(secrets),
+        "-e", f"TS_HOSTNAME={ts_hostname(entry)}",
+        "-e", "TS_USERSPACE=true",
+        "-e", "TS_STATE_DIR=/var/lib/tailscale",
+        "-e", "TS_SERVE_CONFIG=/config/serve.json",
+        "-v", f"{directory / 'serve.json'}:/config/serve.json:ro",
+        "-v", f"{ts_state_volume(entry)}:/var/lib/tailscale",
+        *labels(entry, "ts"), config["WTENV_TS_IMAGE"],
+    )
+
+
+def ts_state_volume(entry):
+    return f"wt-{entry['slug']}-ts-state"
+
+
+def stop_tailscale(entry, forget=False):
+    docker("rm", "-f", names(entry)["ts"], check=False)
+    if forget:
+        docker("volume", "rm", ts_state_volume(entry), check=False)
+
+
+def ensure_git_exclude(root):
+    common = run(["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                 capture=True).stdout.strip()
+    exclude = Path(common) / "info/exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    current = exclude.read_text() if exclude.exists() else ""
+    if ".wtenv/" not in current.split():
+        exclude.write_text(current.rstrip("\n") + ("\n" if current else "") + ".wtenv/\n")
+
+
+def node_modules_stale(frontend):
+    marker = frontend / "node_modules/.modules.yaml"
+    lock = frontend / "pnpm-lock.yaml"
+    return not marker.exists() or lock.stat().st_mtime > marker.stat().st_mtime
+
+
+def frontend_env(config, entry):
+    base = parse_env_file(Path(config["WTENV_MAIN_CHECKOUT"]) / "frontend/.env")
+    env = dict(os.environ)
+    env.update({k: v for k, v in base.items() if k.startswith("VITE_")})
+    env.update({
+        "VITE_BASE_API_URL": "",
+        "VITE_WEB_SOCKET_URL": f"ws://localhost:{entry['backend_port']}/ws",
+        "WTENV_BACKEND_URL": f"http://127.0.0.1:{entry['backend_port']}",
+        "WTENV_FRONTEND_PORT": str(entry["frontend_port"]),
+        "BROWSER": "none",
+    })
+    return env
+
+
+def vite_pid(entry):
+    pidfile = env_dir(entry) / "vite.pid"
+    if not pidfile.exists():
+        return None
+    pid = int(pidfile.read_text().strip())
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pidfile.unlink(missing_ok=True)
+        return None
+    return pid
+
+
+def start_frontend(config, entry, root):
+    frontend = root / "frontend"
+    if node_modules_stale(frontend):
+        log("pnpm install --frozen-lockfile")
+        result = run(["pnpm", "install", "--frozen-lockfile"], cwd=frontend, check=False)
+        if result.returncode != 0:
+            die("pnpm install failed")
+    if vite_pid(entry):
+        return
+    ensure_git_exclude(root)
+    wrapper = frontend / ".wtenv/vite.config.mts"
+    wrapper.parent.mkdir(exist_ok=True)
+    wrapper.write_text(VITE_WRAPPER)
+    logfile = env_dir(entry) / "vite.log"
+    log(f"starting vite on :{entry['frontend_port']}")
+    with open(logfile, "w") as out:
+        proc = subprocess.Popen(
+            [str(frontend / "node_modules/.bin/vite"), "--config", str(wrapper)],
+            cwd=frontend, env=frontend_env(config, entry), stdout=out, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True,
+        )
+    (env_dir(entry) / "vite.pid").write_text(str(proc.pid))
+
+
+def stop_frontend(entry):
+    pid = vite_pid(entry)
+    if not pid:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pid, signal.SIGTERM)
+    for _ in range(20):
+        if not vite_pid(entry):
+            break
+        time.sleep(0.25)
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGKILL)
+    (env_dir(entry) / "vite.pid").unlink(missing_ok=True)
+
+
+def http_ok(url, timeout=3):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.status < 500
+    except urllib.error.HTTPError as error:
+        return error.code < 500
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def wait_for(label, url, seconds, on_fail):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if http_ok(url):
+            return
+        time.sleep(1)
+    on_fail()
+    die(f"{label} did not become healthy at {url} within {seconds}s")
+
+
+def tail_container(name, lines=60):
+    result = docker("logs", "--tail", str(lines), name, check=False)
+    print(result.stdout + result.stderr, file=sys.stderr)
+
+
+def tail_file(path, lines=60):
+    if path.exists():
+        print("\n".join(path.read_text().splitlines()[-lines:]), file=sys.stderr)
+
+
+def status_of(entry):
+    n = names(entry)
+    return {
+        "backend": container_state(n["app"]) or "absent",
+        "redis": container_state(n["redis"]) or "absent",
+        "celery": container_state(n["celery"]) or "off",
+        "frontend": "running" if vite_pid(entry) else "stopped",
+        "tailscale": container_state(n["ts"]) or "off",
+    }
+
+
+def print_info(config, entry, as_json=False):
+    link = urls(config, entry)
+    info = {
+        "slug": entry["slug"],
+        "path": entry["path"],
+        "app_url": link["app"],
+        "api_url": link["api"],
+        "tailnet_url": link["tailnet"],
+        "database": entry["db"],
+        "login_email": config["WTENV_LOGIN_EMAIL"] or None,
+        "login_password": config["WTENV_LOGIN_PASSWORD"] or None,
+        "status": status_of(entry),
+        "logs": {
+            "backend": f"docker logs {names(entry)['app']}",
+            "frontend": str(env_dir(entry) / "vite.log"),
+        },
+    }
+    if as_json:
+        print(json.dumps(info, indent=2))
+        return
+    status = info["status"]
+    print(f"\nwtenv {entry['slug']}")
+    print(f"  app       {link['app']}")
+    if link["tailnet"]:
+        print(f"  tailnet   {link['tailnet']}")
+    print(f"  api       {link['api']}")
+    print(f"  database  {entry['db']}")
+    if info["login_email"]:
+        print(f"  login     {info['login_email']} / {info['login_password']}")
+    print("  status    " + ", ".join(f"{k}={v}" for k, v in status.items()))
+
+
+def dirty_files(root, pathspec):
+    result = run(["git", "-C", str(root), "status", "--porcelain", "--", pathspec], capture=True)
+    return {line[3:] for line in result.stdout.splitlines() if line.startswith(" M")}
+
+
+def cmd_up(args, config):
+    root = worktree_root(args.path)
+    entry = allocate(config, root)
+    ensure_database(config, entry, reset=args.reset_db)
+    ensure_redis(config, entry)
+    if not args.skip_migrate:
+        sync_and_migrate(config, entry, root)
+    start_backend(config, entry, root, recreate=args.restart)
+    if args.celery:
+        start_celery(config, entry, root, recreate=args.restart)
+    if args.restart:
+        stop_frontend(entry)
+    inlang = "frontend/project.inlang"
+    dirty_before = dirty_files(root, inlang)
+    start_frontend(config, entry, root)
+    name = names(entry)["app"]
+    wait_for("backend", f"http://127.0.0.1:{entry['backend_port']}/health/", 180, lambda: tail_container(name))
+    wait_for("frontend", f"http://127.0.0.1:{entry['frontend_port']}/", 120,
+             lambda: tail_file(env_dir(entry) / "vite.log"))
+    ensure_tailscale(config, entry)
+    link = urls(config, entry)
+    if config["WTENV_TS_AUTHKEY"]:
+        deadline = time.time() + 90
+        while time.time() < deadline and not http_ok(link["tailnet"], timeout=10):
+            time.sleep(2)
+        if not http_ok(link["tailnet"], timeout=10):
+            print(f"wtenv: warning: {link['tailnet']} not reachable yet; see `wtenv logs ts`", file=sys.stderr)
+    time.sleep(2)
+    touched = sorted(dirty_files(root, inlang) - dirty_before)
+    if touched:
+        run(["git", "-C", str(root), "checkout", "--", *touched], capture=True)
+    print_info(config, entry, args.json)
+
+
+def stop_env(entry, forget=False):
+    stop_frontend(entry)
+    stop_tailscale(entry, forget=forget)
+    for name in names(entry).values():
+        docker("rm", "-f", name, check=False)
+
+
+def cmd_down(args, config):
+    entry = find_entry(worktree_root(args.path))
+    stop_env(entry)
+    log(f"stopped {entry['slug']} (database {entry['db']} kept)")
+
+
+def destroy_entry(config, entry, forget=False):
+    stop_env(entry, forget=forget)
+    if db_exists(config, entry["db"]):
+        psql(config, f"DROP DATABASE {entry['db']} WITH (FORCE)")
+    with state_lock():
+        state = read_state()
+        state.pop(entry["slug"], None)
+        write_state(state)
+    log(f"destroyed {entry['slug']}")
+
+
+def cmd_destroy(args, config):
+    destroy_entry(config, find_entry(worktree_root(args.path)))
+
+
+def cmd_info(args, config):
+    print_info(config, find_entry(worktree_root(args.path)), args.json)
+
+
+def cmd_ls(args, config):
+    state = read_state()
+    rows = []
+    for entry in sorted(state.values(), key=lambda e: e["index"]):
+        status = status_of(entry)
+        rows.append({**entry, "status": status, "urls": urls(config, entry)})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print("no envs")
+        return
+    for row in rows:
+        s = row["status"]
+        alive = "up" if s["backend"] == "running" and s["frontend"] == "running" else "down"
+        exists = "" if Path(row["path"]).exists() else "  (worktree gone)"
+        print(f"{row['slug']:<32} {alive:<5} {row['urls']['tailnet'] or row['urls']['app']}{exists}")
+
+
+def cmd_logs(args, config):
+    entry = find_entry(worktree_root(args.path))
+    if args.service == "frontend":
+        cmd = ["tail", "-n", str(args.lines)] + (["-f"] if args.follow else []) + [str(env_dir(entry) / "vite.log")]
+    else:
+        name = names(entry)["app" if args.service == "backend" else args.service]
+        cmd = ["docker", "logs", "--tail", str(args.lines)] + (["-f"] if args.follow else []) + [name]
+    os.execvp(cmd[0], cmd)
+
+
+def cmd_exec(args, config):
+    entry = find_entry(worktree_root(args.path))
+    if not args.command:
+        die("usage: wtenv exec -- <command>")
+    cmd = args.command[1:] if args.command[0] == "--" else args.command
+    os.execvp("docker", ["docker", "exec", "-i", names(entry)["app"], *cmd])
+
+
+def cmd_template(args, config):
+    build_template(config)
+
+
+def cmd_prune(args, config):
+    for entry in list(read_state().values()):
+        if not Path(entry["path"]).exists():
+            destroy_entry(config, entry, forget=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="wtenv", description="Per-worktree moxie-link dev environments")
+    parser.add_argument("-C", "--path", type=Path, default=Path.cwd(), help="worktree path (default: cwd)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    up = sub.add_parser("up", help="start (or reuse) this worktree's env")
+    up.add_argument("--celery", action="store_true", help="also run one Celery worker for all queues")
+    up.add_argument("--restart", action="store_true", help="recreate backend/celery/vite processes")
+    up.add_argument("--reset-db", action="store_true", help="recreate the database from the template")
+    up.add_argument("--skip-migrate", action="store_true", help="skip uv sync + migrate")
+    up.add_argument("--json", action="store_true")
+    up.set_defaults(func=cmd_up)
+
+    sub.add_parser("down", help="stop processes, keep the database").set_defaults(func=cmd_down)
+    sub.add_parser("destroy", help="stop and drop the database, free the ports").set_defaults(func=cmd_destroy)
+
+    info = sub.add_parser("info", help="URLs, login, status")
+    info.add_argument("--json", action="store_true")
+    info.set_defaults(func=cmd_info)
+
+    ls = sub.add_parser("ls", help="list all envs")
+    ls.add_argument("--json", action="store_true")
+    ls.set_defaults(func=cmd_ls)
+
+    logs = sub.add_parser("logs", help="show logs")
+    logs.add_argument("service", nargs="?", default="backend", choices=["backend", "frontend", "celery", "redis", "ts"])
+    logs.add_argument("-f", "--follow", action="store_true")
+    logs.add_argument("-n", "--lines", type=int, default=100)
+    logs.set_defaults(func=cmd_logs)
+
+    exe = sub.add_parser("exec", help="run a command in the backend container")
+    exe.add_argument("command", nargs=argparse.REMAINDER)
+    exe.set_defaults(func=cmd_exec)
+
+    sub.add_parser("template", help="rebuild the template DB from the main dev DB").set_defaults(func=cmd_template)
+    sub.add_parser("prune", help="destroy envs whose worktree no longer exists").set_defaults(func=cmd_prune)
+
+    args = parser.parse_args()
+    args.func(args, load_config())
+
+
+if __name__ == "__main__":
+    main()
