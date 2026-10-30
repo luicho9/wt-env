@@ -10,9 +10,9 @@ Per worktree (`wtenv up`):
 
 | Piece | Details |
 |---|---|
-| Database | `wt_<slug>`, created with `CREATE DATABASE ... TEMPLATE wt_template`. `wt_template` is a `pg_dump` of the main dev DB (`test`), built on first use or with `wtenv template`. |
+| Database | `wt_<slug>`, created with `CREATE DATABASE ... TEMPLATE wt_template`. `wt_template` is a `pg_dump` of the main dev DB (`test`), built on first use or with `wtenv template`. Before cloning, the template is migrated to the main checkout's migrations whenever they change, so a new worktree only applies its own branch's migrations. |
 | Redis | `wt-<slug>-redis`. Each env has its own broker, so main's Celery workers never pick up a branch's tasks. |
-| Backend | `wt-<slug>-app`: runserver with autoreload and the worktree's `backend/` mounted. Runs `uv sync` + `migrate` on every `up`. The venv lives in a Docker volume keyed by the `uv.lock` hash, so worktrees on the same lock share it. |
+| Backend | `wt-<slug>-app`: one container that runs `uv sync`, `migrate` (only when the worktree's migration files changed since the last successful run) and then runserver with autoreload, with the worktree's `backend/` mounted. If it's already running and new migrations appear, `up` runs `migrate` inside it. The venv lives in a Docker volume keyed by the `uv.lock` hash, so worktrees on the same lock share it. |
 | Celery | optional (`--celery`): one worker for every queue. |
 | Frontend | Vite on the host, using a wrapper config (`frontend/.wtenv/vite.config.mts`, git-excluded) that extends the repo config. `VITE_BASE_API_URL` is empty so the app calls `/api` on its own origin and Vite proxies it to the backend. The same URL works on localhost and over Tailscale. |
 | Ports | frontend `4100+n`, backend `4200+n`, allocated per worktree and stored in `~/.local/state/wtenv/envs.json`. |
@@ -21,6 +21,17 @@ Per worktree (`wtenv up`):
 `up` also:
 - defaults `PCC_TENANT_KEY=moxie`;
 - reverts the `frontend/project.inlang/.gitignore` rewrite Paraglide does on startup, so agents don't commit it.
+
+## Startup time
+
+| Case | Time |
+|---|---|
+| new worktree (node_modules already installed) | ~35s |
+| new worktree with a fresh `pnpm install` | ~45s |
+| after `down` | ~25s |
+| already running | <1s |
+
+The frontend (pnpm + Vite) starts in parallel with the backend. Most of the remaining time is Django booting: runserver's autoreloader imports the project twice.
 
 ## Install
 

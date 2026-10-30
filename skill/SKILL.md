@@ -9,7 +9,7 @@ description: Run the current moxie-link worktree as a live app (its own backend,
 
 ## Steps
 
-1. From the worktree root, run `wtenv up --json`. Add `--celery` only if the flow needs background tasks (notes AI, PCC sync, billing jobs, emails). The first run takes about 2 minutes. Later runs are quick and reuse what is already running.
+1. From the worktree root, run `wtenv up --json`. Add `--celery` only if the flow needs background tasks (notes AI, PCC sync, billing jobs, emails). The first run in a worktree takes about 40 seconds. Running it again while the env is up returns in under a second, so call it whenever you need the URL.
    - It runs `uv sync` and `migrate` for this branch. If it fails, the output shows the error. Fix the branch and run it again.
    - The backend reloads on Python edits and Vite hot-reloads frontend edits, so you don't need to restart after editing. After changing dependencies or settings, run `wtenv up --restart`.
 2. Open `app_url` from the JSON (`http://localhost:41xx`) with the preview browser tools. Log in with `login_email` / `login_password` from the same JSON.

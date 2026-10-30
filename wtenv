@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +22,8 @@ BACKEND_OVERRIDES_FILE = CONFIG_DIR / "backend.env"
 STATE_DIR = Path(os.environ.get("WTENV_STATE_DIR", Path.home() / ".local/state/wtenv"))
 STATE_FILE = STATE_DIR / "envs.json"
 LOCK_FILE = STATE_DIR / "envs.lock"
+TEMPLATE_STATE_FILE = STATE_DIR / "template.json"
+TEMPLATE_LOCK_FILE = STATE_DIR / "template.lock"
 
 DEFAULTS = {
     "WTENV_MAIN_CHECKOUT": str(Path.home() / "work/moxie-link"),
@@ -117,11 +120,23 @@ def docker(*args, check=True, capture=True):
 
 
 @contextlib.contextmanager
-def state_lock():
+def file_lock(path):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(LOCK_FILE, "w") as handle:
+    with open(path, "w") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
         yield
+
+
+def state_lock():
+    return file_lock(LOCK_FILE)
+
+
+def update_entry(slug, **fields):
+    with state_lock():
+        state = read_state()
+        if slug in state:
+            state[slug].update(fields)
+            write_state(state)
 
 
 def read_state():
@@ -279,13 +294,59 @@ def build_template(config):
     if result.returncode != 0:
         die("template restore failed")
     psql(config, f"ALTER DATABASE {template} WITH is_template true")
+    TEMPLATE_STATE_FILE.unlink(missing_ok=True)
     log(f"template {template} ready")
+
+
+def migrations_fingerprint(backend):
+    digest = hashlib.sha256()
+    for path in sorted((backend / "src").rglob("migrations/*.py")):
+        digest.update(str(path.relative_to(backend)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def migrate_template(config):
+    template = config["WTENV_TEMPLATE_DB"]
+    main_backend = Path(config["WTENV_MAIN_CHECKOUT"]) / "backend"
+    fingerprint = migrations_fingerprint(main_backend)
+    stored = json.loads(TEMPLATE_STATE_FILE.read_text()) if TEMPLATE_STATE_FILE.exists() else {}
+    if stored.get("migrations") == fingerprint:
+        return
+    log(f"migrating {template} to the main checkout's migrations (once per main update)")
+    env_file = STATE_DIR / "template.env"
+    write_backend_env(config, env_file, db=template, redis="redis", origins=[], frontend_url="http://localhost")
+    venv = venv_volume(main_backend.parent)
+    ensure_volume(config, venv)
+    ensure_volume(config, "wtenv-uv-cache")
+    logfile = STATE_DIR / "template-migrate.log"
+    with open(logfile, "w") as out:
+        result = subprocess.run(
+            ["docker", "run", "--rm", "--network", config["WTENV_NETWORK"], "--env-file", str(env_file),
+             "-v", f"{main_backend}:/app", "-v", f"{venv}:/app/.venv", "-v", "wtenv-uv-cache:/uv-cache",
+             "-w", "/app", config["WTENV_IMAGE"], "sh", "-c",
+             "uv sync --frozen --group test --quiet && python manage.py migrate --noinput"],
+            stdout=out, stderr=subprocess.STDOUT,
+        )
+    if result.returncode != 0:
+        print(f"wtenv: warning: migrating the template failed (see {logfile}); worktrees will migrate themselves",
+              file=sys.stderr)
+        return
+    TEMPLATE_STATE_FILE.write_text(json.dumps({"migrations": fingerprint, "at": int(time.time())}))
 
 
 def ensure_database(config, entry, reset=False):
     template = config["WTENV_TEMPLATE_DB"]
-    if not db_exists(config, template):
-        build_template(config)
+    db = entry["db"]
+    with file_lock(TEMPLATE_LOCK_FILE):
+        if not db_exists(config, template):
+            build_template(config)
+        if reset or not db_exists(config, db):
+            migrate_template(config)
+        clone_database(config, entry, template, reset)
+
+
+def clone_database(config, entry, template, reset):
     db = entry["db"]
     if reset and db_exists(config, db):
         log(f"dropping {db}")
@@ -332,18 +393,23 @@ def venv_volume(root):
 
 
 def backend_env(config, entry):
-    base = parse_env_file(Path(config["WTENV_MAIN_CHECKOUT"]) / "backend/.env")
-    base.setdefault("PCC_TENANT_KEY", "moxie")
-    base.update(parse_env_file(BACKEND_OVERRIDES_FILE))
-    redis = names(entry)["redis"]
     frontend_port = entry["frontend_port"]
     link = urls(config, entry)
     origins = [f"http://localhost:{frontend_port}", f"http://127.0.0.1:{frontend_port}"]
     origins += [url for key in ("tailnet", "tailnet_port", "tailnet_short") if (url := link[key])]
-    origins = list(dict.fromkeys(origins))
+    path = env_dir(entry) / "backend.env"
+    write_backend_env(config, path, db=entry["db"], redis=names(entry)["redis"],
+                      origins=list(dict.fromkeys(origins)), frontend_url=link["tailnet"] or link["app"])
+    return path
+
+
+def write_backend_env(config, path, db, redis, origins, frontend_url):
+    base = parse_env_file(Path(config["WTENV_MAIN_CHECKOUT"]) / "backend/.env")
+    base.setdefault("PCC_TENANT_KEY", "moxie")
+    base.update(parse_env_file(BACKEND_OVERRIDES_FILE))
     base.update({
         "DEBUG": "True",
-        "DATABASE_NAME": entry["db"],
+        "DATABASE_NAME": db,
         "DATABASE_HOST": "database",
         "DATABASE_PORT": "5432",
         "REDIS_HOST": redis,
@@ -354,15 +420,13 @@ def backend_env(config, entry):
         "ALLOWED_HOSTS": "*",
         "CORS_ALLOWED_ORIGINS": ",".join(origins),
         "CSRF_TRUSTED_ORIGINS": ",".join(origins),
-        "FRONTEND_URL": link["tailnet"] or link["app"],
+        "FRONTEND_URL": frontend_url,
         "UV_LINK_MODE": "copy",
         "UV_CACHE_DIR": "/uv-cache",
         "UV_PROJECT_ENVIRONMENT": "/app/.venv",
     })
-    path = env_dir(entry) / "backend.env"
     path.write_text("".join(f"{k}={v}\n" for k, v in base.items() if "\n" not in v))
     path.chmod(0o600)
-    return path
 
 
 def backend_run_args(config, entry, root, role):
@@ -380,28 +444,56 @@ def backend_run_args(config, entry, root, role):
     ]
 
 
-def sync_and_migrate(config, entry, root):
-    log("uv sync + migrate (output below)")
-    script = "uv sync --frozen --group test --quiet && python manage.py migrate --noinput"
-    args = backend_run_args(config, entry, root, "migrate")
-    result = run(["docker", "run", "--rm", *args, config["WTENV_IMAGE"], "sh", "-c", script], check=False)
-    if result.returncode != 0:
-        die("uv sync / migrate failed; fix the branch and rerun `wtenv up`")
+BACKEND_SCRIPT = (
+    "uv sync --frozen --group test --quiet"
+    " && if [ \"$WTENV_MIGRATE\" = 1 ]; then python manage.py migrate --noinput; fi"
+    " && exec python manage.py runserver 0.0.0.0:9000 --skip-checks"
+)
 
 
-def start_backend(config, entry, root, recreate=False):
+def container_label(name, label):
+    result = docker("inspect", "-f", f'{{{{index .Config.Labels "{label}"}}}}', name, check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def start_backend(config, entry, root, recreate=False, migrate=True):
     name = names(entry)["app"]
+    venv = venv_volume(root)
     status = container_state(name)
+    if status == "running" and container_label(name, "wtenv.venv") != venv:
+        recreate = True
     if status == "running" and not recreate:
+        if migrate:
+            log("new migrations: running migrate in the backend container")
+            result = run(["docker", "exec", name, "python", "manage.py", "migrate", "--noinput"], check=False)
+            if result.returncode != 0:
+                die("migrate failed; fix the branch and rerun `wtenv up`")
         return
     if status:
         docker("rm", "-f", name)
-    log(f"starting {name} on :{entry['backend_port']}")
+    log(f"starting {name} on :{entry['backend_port']}" + (" (uv sync + migrate first)" if migrate else ""))
     args = backend_run_args(config, entry, root, "app")
     docker(
         "run", "-d", "--name", name, "-p", f"{entry['backend_port']}:9000", *args,
-        config["WTENV_IMAGE"], "python", "manage.py", "runserver", "0.0.0.0:9000",
+        "--label", f"wtenv.venv={venv}", "-e", f"WTENV_MIGRATE={1 if migrate else 0}",
+        config["WTENV_IMAGE"], "sh", "-c", BACKEND_SCRIPT,
     )
+
+
+def wait_backend(entry, seconds=300):
+    name = names(entry)["app"]
+    url = f"http://127.0.0.1:{entry['backend_port']}/health/"
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if http_ok(url):
+            return
+        if container_state(name) != "running":
+            tail_container(name, 80)
+            die("backend exited during startup (uv sync / migrate / boot failed, logs above); "
+                "fix the branch and rerun `wtenv up`")
+        time.sleep(1)
+    tail_container(name, 80)
+    die(f"backend did not become healthy at {url} within {seconds}s")
 
 
 def start_celery(config, entry, root, recreate=False):
@@ -514,8 +606,12 @@ def start_frontend(config, entry, root):
     frontend = root / "frontend"
     if node_modules_stale(frontend):
         log("pnpm install --frozen-lockfile")
-        result = run(["pnpm", "install", "--frozen-lockfile"], cwd=frontend, check=False)
+        logfile = env_dir(entry) / "pnpm.log"
+        with open(logfile, "w") as out:
+            result = subprocess.run(["pnpm", "install", "--frozen-lockfile"], cwd=frontend,
+                                    stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         if result.returncode != 0:
+            tail_file(logfile)
             die("pnpm install failed")
     if vite_pid(entry):
         return
@@ -628,38 +724,66 @@ def dirty_files(root, pathspec):
     return {line[3:] for line in result.stdout.splitlines() if line.startswith(" M")}
 
 
+def run_in_thread(target, *args):
+    failure = {}
+
+    def wrapped():
+        try:
+            target(*args)
+        except SystemExit as error:
+            failure["code"] = error.code or 1
+        except Exception as error:
+            print(f"wtenv: {error}", file=sys.stderr)
+            failure["code"] = 1
+
+    thread = threading.Thread(target=wrapped)
+    thread.start()
+    return thread, failure
+
+
+def bring_up_frontend(config, entry, root):
+    start_frontend(config, entry, root)
+    wait_for("frontend", f"http://127.0.0.1:{entry['frontend_port']}/", 120,
+             lambda: tail_file(env_dir(entry) / "vite.log"))
+
+
 def cmd_up(args, config):
     root = worktree_root(args.path)
     entry = allocate(config, root)
-    ensure_database(config, entry, reset=args.reset_db)
-    ensure_redis(config, entry)
-    if not args.skip_migrate:
-        sync_and_migrate(config, entry, root)
-    start_backend(config, entry, root, recreate=args.restart)
-    if args.celery:
-        start_celery(config, entry, root, recreate=args.restart)
+    ensure_tailscale(config, entry)
     if args.restart:
         stop_frontend(entry)
+    vite_was_running = bool(vite_pid(entry))
     inlang = "frontend/project.inlang"
     dirty_before = dirty_files(root, inlang)
-    start_frontend(config, entry, root)
-    name = names(entry)["app"]
-    wait_for("backend", f"http://127.0.0.1:{entry['backend_port']}/health/", 180, lambda: tail_container(name))
-    wait_for("frontend", f"http://127.0.0.1:{entry['frontend_port']}/", 120,
-             lambda: tail_file(env_dir(entry) / "vite.log"))
-    ensure_tailscale(config, entry)
-    link = urls(config, entry)
-    if config["WTENV_TS_AUTHKEY"]:
-        deadline = time.time() + 90
-        while time.time() < deadline and not http_ok(link["tailnet"], timeout=10):
-            time.sleep(2)
-        if not http_ok(link["tailnet"], timeout=10):
-            print(f"wtenv: warning: {link['tailnet']} not reachable yet; see `wtenv logs ts`", file=sys.stderr)
-    time.sleep(2)
-    touched = sorted(dirty_files(root, inlang) - dirty_before)
-    if touched:
-        run(["git", "-C", str(root), "checkout", "--", *touched], capture=True)
+    frontend, frontend_failure = run_in_thread(bring_up_frontend, config, entry, root)
+
+    ensure_database(config, entry, reset=args.reset_db)
+    if args.reset_db:
+        entry["migrated"] = None
+    ensure_redis(config, entry)
+    fingerprint = migrations_fingerprint(root / "backend")
+    migrate = not args.skip_migrate and entry.get("migrated") != fingerprint
+    start_backend(config, entry, root, recreate=args.restart or args.reset_db, migrate=migrate)
+    if args.celery:
+        start_celery(config, entry, root, recreate=args.restart)
+    wait_backend(entry)
+    if migrate:
+        update_entry(entry["slug"], migrated=fingerprint)
+
+    frontend.join()
+    if frontend_failure:
+        sys.exit(frontend_failure["code"])
+    if not vite_was_running:
+        time.sleep(1)
+        touched = sorted(dirty_files(root, inlang) - dirty_before)
+        if touched:
+            run(["git", "-C", str(root), "checkout", "--", *touched], capture=True)
     print_info(config, entry, args.json)
+    link = urls(config, entry)
+    if config["WTENV_TS_AUTHKEY"] and not http_ok(link["tailnet"], timeout=2):
+        print(f"\n  note: {link['tailnet']} is still provisioning its HTTPS cert; it's usually ready within a minute",
+              file=sys.stderr)
 
 
 def stop_env(entry, forget=False):
@@ -732,7 +856,10 @@ def cmd_exec(args, config):
 
 
 def cmd_template(args, config):
-    build_template(config)
+    with file_lock(TEMPLATE_LOCK_FILE):
+        if not args.migrate_only:
+            build_template(config)
+        migrate_template(config)
 
 
 def cmd_prune(args, config):
@@ -775,7 +902,9 @@ def main():
     exe.add_argument("command", nargs=argparse.REMAINDER)
     exe.set_defaults(func=cmd_exec)
 
-    sub.add_parser("template", help="rebuild the template DB from the main dev DB").set_defaults(func=cmd_template)
+    template = sub.add_parser("template", help="rebuild the template DB from the main dev DB, then migrate it")
+    template.add_argument("--migrate-only", action="store_true", help="only migrate it to the main checkout")
+    template.set_defaults(func=cmd_template)
     sub.add_parser("prune", help="destroy envs whose worktree no longer exists").set_defaults(func=cmd_prune)
 
     args = parser.parse_args()
