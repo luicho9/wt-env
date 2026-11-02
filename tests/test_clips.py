@@ -20,11 +20,11 @@ class ClipCommandTests(unittest.TestCase):
         self.events = self.root / "events.json"
         self.events.write_text("[]")
 
-    def cut(self, output=None, **kwargs):
+    def cut(self, output=None, speed=None, **kwargs):
         return subprocess.run(
             [sys.executable, str(CLI), "clip", "cut", str(self.source),
              "--events", str(self.events), "--started-at", "2026-01-01T00:00:00Z",
-             "-o", str(output or self.output)],
+             "-o", str(output or self.output)] + ([] if speed is None else ["--speed", str(speed)]),
             capture_output=True, text=True, **kwargs,
         )
 
@@ -61,19 +61,21 @@ class ClipCommandTests(unittest.TestCase):
         )
         epoch_ms = 1767225600000
         self.events.write_text(json.dumps([
-            {"t": epoch_ms + 1000, "kind": "pointer"},
+            {"t": epoch_ms + 1000, "kind": "move"},
             {"t": epoch_ms + 3000, "kind": "change"},
             {"t": epoch_ms + 6000, "kind": "typing"},
         ]))
-        result = self.cut()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        report = json.loads(result.stdout)
-        self.assertTrue(report["cut"], report)
-        self.assertEqual(report["segments"], [[0.75, 4.0], [5.75, 8.5]])
-        duration = float(subprocess.check_output([
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "csv=p=0", str(self.output)], text=True))
-        self.assertAlmostEqual(duration, 6.0, delta=0.2)
+        for speed in (None, 1):
+            with self.subTest(speed=speed):
+                result = self.cut(speed=speed)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                report = json.loads(result.stdout)
+                self.assertTrue(report["cut"], report)
+                self.assertEqual(report["segments"], [[0.75, 4.0], [5.75, 8.5]])
+                duration = float(subprocess.check_output([
+                    "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                    "-of", "csv=p=0", str(self.output)], text=True))
+                self.assertAlmostEqual(duration, 8.0 if speed is None else 6.0, delta=0.2)
 
 
 if __name__ == "__main__":

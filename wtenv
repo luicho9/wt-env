@@ -881,7 +881,7 @@ def cmd_prune(args, config):
             destroy_entry(config, entry, forget=True)
 
 
-CLIP_INPUT_KINDS = {"pointer", "key", "typing", "scroll", "load"}
+CLIP_INPUT_KINDS = {"move", "pointer", "key", "typing", "scroll", "load"}
 CLIP_PRE = 0.25
 CLIP_POST = 1.0
 CLIP_SETTLE = 4.0
@@ -925,9 +925,9 @@ def clip_windows(events, started_at, duration, pre, post, settle, hold=0.0):
     return [(a, b) for a, b in merged if b - a > 0.05]
 
 
-def cut_video(source, segments, output):
+def cut_video(source, segments, output, speed):
     branches = "".join(
-        f"[src{i}]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}];" for i, (a, b) in enumerate(segments)
+        f"[src{i}]trim=start={a:.3f}:end={b:.3f},setpts=(PTS-STARTPTS)/{speed}[v{i}];" for i, (a, b) in enumerate(segments)
     )
     joined = "".join(f"[v{i}]" for i in range(len(segments)))
     inputs = "".join(f"[src{i}]" for i in range(len(segments)))
@@ -950,6 +950,8 @@ def cmd_clip_cut(args, config):
             value = getattr(args, name)
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"--{name} must be a finite nonnegative number")
+        if not math.isfinite(args.speed) or args.speed <= 0:
+            raise ValueError("--speed must be a finite positive number")
         events_text = sys.stdin.read() if str(args.events) == "-" else args.events.read_text()
         events = json.loads(events_text)
         if isinstance(events, dict):
@@ -968,8 +970,8 @@ def cmd_clip_cut(args, config):
         segments = clip_windows(events, started_at, duration, args.pre, args.post, args.settle, args.hold)
         if not segments:
             raise ValueError("no input events fall inside the recording")
-        cut_video(source, segments, output)
-        result.update(cut=True, duration=round(sum(b - a for a, b in segments), 2),
+        cut_video(source, segments, output, args.speed)
+        result.update(cut=True, duration=round(sum(b - a for a, b in segments) / args.speed, 2), speed=args.speed,
                       segments=[[round(a, 2), round(b, 2)] for a, b in segments])
     except (ValueError, TypeError, KeyError, OSError, subprocess.CalledProcessError, SystemExit) as error:
         shutil.copyfile(source, output)
@@ -1030,6 +1032,7 @@ def main():
     cut.add_argument("--settle", type=float, default=CLIP_SETTLE,
                      help="seconds after an action during which page changes extend its window")
     cut.add_argument("--hold", type=float, default=CLIP_HOLD, help="extra seconds kept on the final state")
+    cut.add_argument("--speed", type=float, default=0.75, help="playback speed (default: 0.75; 1 for real time)")
     cut.set_defaults(func=cmd_clip_cut)
 
     args = parser.parse_args()

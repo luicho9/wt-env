@@ -1,11 +1,8 @@
 (() => {
   const FLAG = "wtenv-clip";
   const LOG = "wtenv-clip-events";
-  const LAST = "wtenv-clip-pointer";
   const CHANGE_THROTTLE_MS = 200;
-  const RIPPLE_MS = 900;
   const PILL_MS = 1200;
-  const ORANGE = "rgb(255, 80, 40)";
 
   if (window.__wtenvClip) return;
 
@@ -15,7 +12,6 @@
   let flushTimer = null;
   let lastChange = 0;
   let root = null;
-  let cursor = null;
   let pill = null;
   let pillTimer = null;
   let observer = null;
@@ -41,50 +37,16 @@
     root.setAttribute("data-wtenv-clip", "");
     root.setAttribute("aria-hidden", "true");
     root.style.cssText = "position:fixed;inset:0;pointer-events:none;z-index:2147483647;overflow:hidden";
-    cursor = document.createElement("div");
-    cursor.innerHTML =
-      '<svg width="22" height="22" viewBox="0 0 22 22"><path d="M3 2 L3 18 L7.5 13.8 L10.6 20.5 L13.4 19.3 L10.3 12.7 L16.5 12.4 Z" fill="#111" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"/></svg>';
-    cursor.style.cssText =
-      "position:absolute;left:0;top:0;width:22px;height:22px;margin:-3px 0 0 -3px;transition:transform 220ms cubic-bezier(.4,0,.2,1);filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))";
-    const last = JSON.parse(localStorage.getItem(LAST) || "null") || {
-      x: innerWidth / 2,
-      y: innerHeight / 2,
-    };
-    moveCursor(last.x, last.y, false);
     pill = document.createElement("div");
     pill.style.cssText =
       "position:absolute;left:50%;bottom:28px;transform:translateX(-50%);padding:6px 14px;border-radius:999px;background:rgba(17,17,17,.82);color:#fff;font:600 14px/1.2 system-ui,sans-serif;opacity:0;transition:opacity 150ms";
-    root.append(cursor, pill);
+    root.append(pill);
     document.documentElement.append(root);
   };
 
   const removeRoot = () => {
     root?.remove();
-    root = cursor = pill = null;
-  };
-
-  function moveCursor(x, y, animate = true) {
-    if (!cursor) return;
-    if (!animate) cursor.style.transition = "none";
-    cursor.style.transform = `translate(${x}px, ${y}px)`;
-    if (!animate) {
-      cursor.getBoundingClientRect();
-      cursor.style.transition = "transform 220ms cubic-bezier(.4,0,.2,1)";
-    }
-    localStorage.setItem(LAST, JSON.stringify({ x, y }));
-  }
-
-  const ripple = (x, y) => {
-    const ring = document.createElement("div");
-    ring.style.cssText = `position:absolute;left:${x}px;top:${y}px;width:72px;height:72px;margin:-36px 0 0 -36px;border:4px solid ${ORANGE};border-radius:50%;box-sizing:border-box`;
-    root.append(ring);
-    ring.animate(
-      [
-        { transform: "scale(0.5)", opacity: 1 },
-        { transform: "scale(1)", opacity: 0 },
-      ],
-      { duration: RIPPLE_MS, easing: "ease-out", fill: "forwards" },
-    ).onfinish = () => ring.remove();
+    root = pill = null;
   };
 
   const showPill = (text) => {
@@ -110,17 +72,15 @@
     ArrowRight: "→",
   };
 
-  const onPointerMove = (e) => {
+  let lastMove = 0;
+  const onPointerMove = () => {
     if (!active()) return;
-    ensureRoot();
-    moveCursor(e.clientX, e.clientY);
+    const now = Date.now();
+    if (now - lastMove > 200) record("move");
+    lastMove = now;
   };
 
-  const onPointerDown = (e) => {
-    if (!active()) return;
-    ensureRoot();
-    moveCursor(e.clientX, e.clientY);
-    ripple(e.clientX, e.clientY);
+  const onPointerDown = () => {
     record("pointer");
   };
 
