@@ -4,8 +4,10 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -24,6 +26,7 @@ STATE_FILE = STATE_DIR / "envs.json"
 LOCK_FILE = STATE_DIR / "envs.lock"
 TEMPLATE_STATE_FILE = STATE_DIR / "template.json"
 TEMPLATE_LOCK_FILE = STATE_DIR / "template.lock"
+CLIP_OVERLAY = Path(__file__).resolve().parent / "clip-overlay.js"
 
 DEFAULTS = {
     "WTENV_MAIN_CHECKOUT": str(Path.home() / "work/moxie-link"),
@@ -45,14 +48,23 @@ CELERY_QUEUES = (
     "billing,billing_remit,insurances,note_assistance,ai_suggestions,pcc"
 )
 
-VITE_WRAPPER = """import base from "../vite.config.ts";
+VITE_WRAPPER = """import { readFileSync } from "node:fs";
+import base from "../vite.config.ts";
 
+const clipOverlay = readFileSync(new URL("./clip-overlay.js", import.meta.url), "utf8");
 const backend = process.env.WTENV_BACKEND_URL;
 const port = Number(process.env.WTENV_FRONTEND_PORT);
 const baseProxy = base.server?.proxy ?? {};
 
 export default {
   ...base,
+  plugins: [
+    ...(base.plugins ?? []),
+    {
+      name: "wtenv-clip-overlay",
+      transformIndexHtml: () => [{ tag: "script", children: clipOverlay, injectTo: "head-prepend" }],
+    },
+  ],
   server: {
     ...base.server,
     host: true,
@@ -619,6 +631,7 @@ def start_frontend(config, entry, root):
     wrapper = frontend / ".wtenv/vite.config.mts"
     wrapper.parent.mkdir(exist_ok=True)
     wrapper.write_text(VITE_WRAPPER)
+    shutil.copyfile(CLIP_OVERLAY, wrapper.parent / "clip-overlay.js")
     logfile = env_dir(entry) / "vite.log"
     log(f"starting vite on :{entry['frontend_port']}")
     with open(logfile, "w") as out:
@@ -868,6 +881,104 @@ def cmd_prune(args, config):
             destroy_entry(config, entry, forget=True)
 
 
+CLIP_INPUT_KINDS = {"pointer", "key", "typing", "scroll", "load"}
+CLIP_PRE = 0.25
+CLIP_POST = 1.0
+CLIP_SETTLE = 4.0
+CLIP_MIN_GAP = 0.5
+CLIP_HOLD = 1.5
+
+
+def parse_timestamp(value):
+    if re.fullmatch(r"\d+(\.\d+)?", value):
+        number = float(value)
+        return number / 1000 if number > 1e11 else number
+    from datetime import datetime
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def video_duration(path):
+    out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+              capture=True)
+    return float(out.stdout.strip())
+
+
+def clip_windows(events, started_at, duration, pre, post, settle, hold=0.0):
+    times = sorted((e["t"] / 1000 - started_at, e["kind"]) for e in events)
+    windows = []
+    last_input = None
+    for t, kind in times:
+        if kind in CLIP_INPUT_KINDS:
+            last_input = t
+            windows.append([t - pre, t + post])
+        elif kind == "change" and last_input is not None and t - last_input <= settle and windows:
+            windows[-1][1] = max(windows[-1][1], t + post)
+    if windows:
+        windows[-1][1] = max(w[1] for w in windows) + hold
+    clamped = sorted([max(0.0, a), min(duration, b)] for a, b in windows if b > 0 and a < duration)
+    merged = []
+    for a, b in clamped:
+        if merged and a - merged[-1][1] <= CLIP_MIN_GAP:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [(a, b) for a, b in merged if b - a > 0.05]
+
+
+def cut_video(source, segments, output):
+    branches = "".join(
+        f"[src{i}]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}];" for i, (a, b) in enumerate(segments)
+    )
+    joined = "".join(f"[v{i}]" for i in range(len(segments)))
+    inputs = "".join(f"[src{i}]" for i in range(len(segments)))
+    graph = f"[0:v]fps=30,split={len(segments)}{inputs};{branches}{joined}concat=n={len(segments)}:v=1:a=0[out]"
+    run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-filter_complex", graph,
+         "-map", "[out]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+         "-movflags", "+faststart", str(output)], capture=True)
+
+
+def cmd_clip_cut(args, config):
+    source = args.video.resolve()
+    output = (args.output or source.with_name(f"{source.stem}-cut.mp4")).resolve()
+    if not source.is_file():
+        die(f"recording does not exist: {source}")
+    if source == output or (output.exists() and os.path.samefile(source, output)):
+        die("output must differ from the source recording")
+    result = {"source": str(source), "output": str(output)}
+    try:
+        for name in ("pre", "post", "settle", "hold"):
+            value = getattr(args, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"--{name} must be a finite nonnegative number")
+        events_text = sys.stdin.read() if str(args.events) == "-" else args.events.read_text()
+        events = json.loads(events_text)
+        if isinstance(events, dict):
+            events = events.get("events", events.get("value", []))
+        if not isinstance(events, list) or any(
+            not isinstance(e, dict) or not isinstance(e.get("kind"), str)
+            or not isinstance(e.get("t"), (int, float)) or not math.isfinite(e["t"])
+            for e in events
+        ):
+            raise ValueError("events must be an array of objects with finite t and string kind")
+        started_at = parse_timestamp(args.started_at)
+        if not math.isfinite(started_at):
+            raise ValueError("recording start must be finite")
+        duration = video_duration(source)
+        result["source_duration"] = round(duration, 2)
+        segments = clip_windows(events, started_at, duration, args.pre, args.post, args.settle, args.hold)
+        if not segments:
+            raise ValueError("no input events fall inside the recording")
+        cut_video(source, segments, output)
+        result.update(cut=True, duration=round(sum(b - a for a, b in segments), 2),
+                      segments=[[round(a, 2), round(b, 2)] for a, b in segments])
+    except (ValueError, TypeError, KeyError, OSError, subprocess.CalledProcessError, SystemExit) as error:
+        shutil.copyfile(source, output)
+        result.update(cut=False, error=str(error) or "ffmpeg failed")
+        if "source_duration" in result:
+            result["duration"] = result["source_duration"]
+    print(json.dumps(result, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(prog="wtenv", description="Per-worktree moxie-link dev environments")
     parser.add_argument("-C", "--path", type=Path, default=Path.cwd(), help="worktree path (default: cwd)")
@@ -906,6 +1017,20 @@ def main():
     template.add_argument("--migrate-only", action="store_true", help="only migrate it to the main checkout")
     template.set_defaults(func=cmd_template)
     sub.add_parser("prune", help="destroy envs whose worktree no longer exists").set_defaults(func=cmd_prune)
+
+    clip = sub.add_parser("clip", help="post-process verification recordings")
+    clip_sub = clip.add_subparsers(dest="clip_cmd", required=True)
+    cut = clip_sub.add_parser("cut", help="cut a recording down to the moments around logged actions")
+    cut.add_argument("video", type=Path)
+    cut.add_argument("--events", type=Path, required=True, help="JSON from __wtenvClip.stop() ('-' for stdin)")
+    cut.add_argument("--started-at", required=True, help="recording start (ISO time or epoch ms)")
+    cut.add_argument("-o", "--output", type=Path)
+    cut.add_argument("--pre", type=float, default=CLIP_PRE, help="seconds kept before each action")
+    cut.add_argument("--post", type=float, default=CLIP_POST, help="seconds kept after each action or its last change")
+    cut.add_argument("--settle", type=float, default=CLIP_SETTLE,
+                     help="seconds after an action during which page changes extend its window")
+    cut.add_argument("--hold", type=float, default=CLIP_HOLD, help="extra seconds kept on the final state")
+    cut.set_defaults(func=cmd_clip_cut)
 
     args = parser.parse_args()
     args.func(args, load_config())

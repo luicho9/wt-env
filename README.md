@@ -14,9 +14,11 @@ Per worktree (`wtenv up`):
 | Redis | `wt-<slug>-redis`. Each env has its own broker, so main's Celery workers never pick up a branch's tasks. |
 | Backend | `wt-<slug>-app`: one container that runs `uv sync`, `migrate` (only when the worktree's migration files changed since the last successful run) and then runserver with autoreload, with the worktree's `backend/` mounted. If it's already running and new migrations appear, `up` runs `migrate` inside it. The venv lives in a Docker volume keyed by the `uv.lock` hash, so worktrees on the same lock share it. |
 | Celery | optional (`--celery`): one worker for every queue. |
-| Frontend | Vite on the host, using a wrapper config (`frontend/.wtenv/vite.config.mts`, git-excluded) that extends the repo config. `VITE_BASE_API_URL` is empty so the app calls `/api` on its own origin and Vite proxies it to the backend. The same URL works on localhost and over Tailscale. |
+| Frontend | Vite on the host, using a wrapper config (`frontend/.wtenv/vite.config.mts`, git-excluded) that extends the repo config and inlines the clip overlay. `VITE_BASE_API_URL` is empty so the app calls `/api` on its own origin and Vite proxies it to the backend. The same URL works on localhost and over Tailscale. |
 | Ports | frontend `4100+n`, backend `4200+n`, allocated per worktree and stored in `~/.local/state/wtenv/envs.json`. |
 | Tailscale | `wt-<slug>-ts`: a userspace `tailscaled` sidecar that joins the tailnet as `wt-<slug>` and serves `https://wt-<slug>.<tailnet>.ts.net` → Vite. Its state lives in the `wt-<slug>-ts-state` volume, so restarts keep the same node and hostname. Only runs when `WTENV_TS_AUTHKEY` is set (reusable + ephemeral key); otherwise the tailnet URL is `http://<host>:<port>`. |
+
+Recording clips: the Vite wrapper inlines `clip-overlay.js` into every page. It stays dormant until `window.__wtenvClip.start()`; then it draws a synthetic cursor, click ripples and key/typing/scroll labels, and logs each action with its time in `localStorage`. `wtenv clip cut` keeps 250 ms before and 1 s after each action, extended by page changes up to 4 s after it, merges the windows, and cuts the recording in one ffmpeg pass (`trim` + `setpts=PTS-STARTPTS` + `concat`). This follows Warp's [smart cut](https://github.com/warpdotdev/warp/blob/master/agents/specs/QUALITY-1112-smart-variable-speedcut-for-computer-use-recordings.md) and [click annotations](https://github.com/warpdotdev/warp/blob/master/agents/specs/QUALITY-1169-richer-click-drag-annotations.md). Our recordings come from the agent browser, so the overlay draws live in the page instead of being burned in afterwards.
 
 `up` also:
 - defaults `PCC_TENANT_KEY=moxie`;
@@ -54,6 +56,7 @@ wtenv destroy     # stop, drop DB, free ports
 wtenv ls
 wtenv template    # rebuild wt_template from the main dev DB
 wtenv prune       # destroy envs whose worktree is gone
+wtenv clip cut <recording.mp4> --events events.json --started-at <ISO> [-o out.mp4]
 ```
 
 Use `-C <path>` to target a worktree other than the current directory.
@@ -63,3 +66,5 @@ Use `-C <path>` to target a worktree other than the current directory.
 - WebSockets connect straight to the backend port, so they only work from the mini PC's own browser.
 - A worktree's Tailscale state volume survives `down`/`destroy`, so re-creating its env reuses the same device and hostname. Only `prune` (worktree deleted) drops it; the ephemeral device then expires on its own. If a name ever comes back as `wt-<slug>-1`, delete the stale device in the admin console and remove the `wt-<slug>-ts-state` volume.
 - Requires the main `emr-engine` stack (database at least) to be running.
+- `wtenv clip cut` needs `ffmpeg` and `ffprobe` on the host. Output is silent H.264 MP4 at 30 fps. Keep the final result on screen before stopping; `--hold` keeps available footage rather than generating a freeze frame.
+- Run clip command checks with `python3 -m unittest discover -s tests -v`. The media integration case requires ffmpeg and ffprobe.
