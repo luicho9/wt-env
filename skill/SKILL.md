@@ -40,7 +40,8 @@ Every page carries a dormant overlay for key/typing/scroll labels and action tim
 - `wtenv info [--json]`: URLs, login, and status of this worktree's env.
 - `wtenv up --reset-db`: start over from a fresh copy of the dev DB.
 - `wtenv down`: stop the processes and keep the database. `wtenv destroy`: also drop the database and free the ports.
-- `wtenv ls`: every env on this machine.
+- `wtenv ls`: every env on this machine. `stale` means its containers still run but Vite is gone.
+- When you finish verifying, run `wtenv down`. Backend containers restart with Docker and keep using RAM until stopped.
 - `wtenv clip cut --help`: tune `--pre`, `--post`, `--settle`, `--hold` and `--speed`.
 
 ## Limits

@@ -831,6 +831,13 @@ def cmd_info(args, config):
     print_info(config, find_entry(worktree_root(args.path)), args.json)
 
 
+def env_state(status):
+    if status["backend"] == "running" and status["frontend"] == "running":
+        return "up"
+    containers = (status["backend"], status["redis"], status["celery"], status["tailscale"])
+    return "stale" if any(state not in ("absent", "off") for state in containers) else "down"
+
+
 def cmd_ls(args, config):
     state = read_state()
     rows = []
@@ -845,7 +852,7 @@ def cmd_ls(args, config):
         return
     for row in rows:
         s = row["status"]
-        alive = "up" if s["backend"] == "running" and s["frontend"] == "running" else "down"
+        alive = env_state(s)
         exists = "" if Path(row["path"]).exists() else "  (worktree gone)"
         print(f"{row['slug']:<32} {alive:<5} {row['urls']['tailnet'] or row['urls']['app']}{exists}")
 
@@ -876,9 +883,20 @@ def cmd_template(args, config):
 
 
 def cmd_prune(args, config):
-    for entry in list(read_state().values()):
+    state = read_state()
+    for entry in list(state.values()):
         if not Path(entry["path"]).exists():
             destroy_entry(config, entry, forget=True)
+        elif env_state(status_of(entry)) == "stale":
+            stop_env(entry)
+            log(f"stopped stale {entry['slug']} (database {entry['db']} kept)")
+    result = docker("ps", "-a", "--filter", "label=wtenv.slug", "--format", "{{.Names}}\t{{.Label \"wtenv.slug\"}}",
+                    check=False)
+    for line in result.stdout.splitlines():
+        name, _, slug = line.partition("\t")
+        if slug not in state:
+            docker("rm", "-f", name, check=False)
+            log(f"removed orphan container {name}")
 
 
 CLIP_INPUT_KINDS = {"move", "pointer", "key", "typing", "scroll", "load"}
@@ -1018,7 +1036,7 @@ def main():
     template = sub.add_parser("template", help="rebuild the template DB from the main dev DB, then migrate it")
     template.add_argument("--migrate-only", action="store_true", help="only migrate it to the main checkout")
     template.set_defaults(func=cmd_template)
-    sub.add_parser("prune", help="destroy envs whose worktree no longer exists").set_defaults(func=cmd_prune)
+    sub.add_parser("prune", help="destroy envs whose worktree is gone, stop stale envs, remove orphan containers").set_defaults(func=cmd_prune)
 
     clip = sub.add_parser("clip", help="post-process verification recordings")
     clip_sub = clip.add_subparsers(dest="clip_cmd", required=True)

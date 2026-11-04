@@ -57,7 +57,7 @@ wtenv down        # stop, keep DB
 wtenv destroy     # stop, drop DB, free ports
 wtenv ls
 wtenv template    # rebuild wt_template from the main dev DB
-wtenv prune       # destroy envs whose worktree is gone
+wtenv prune       # destroy envs whose worktree is gone, stop stale ones, remove orphan containers
 wtenv clip cut <recording.mp4> --events events.json --started-at <ISO> [-o out.mp4]
 ```
 
