@@ -26,6 +26,8 @@ Recording clips: the Vite wrapper inlines `clip-overlay.js` into every page. It 
 - defaults `PCC_TENANT_KEY=moxie`;
 - reverts the `frontend/project.inlang/.gitignore` rewrite Paraglide does on startup, so agents don't commit it.
 
+Seeding: `wtenv seed <module>` pipes `seeds/<module>.py` into `manage.py shell` in the backend container, with its options in `WTENV_SEED_ARGS` (a JSON list) and the login email in `WTENV_LOGIN_EMAIL`. A scenario reuses dev-DB rows where it can (moving them to today, setting a status, linking PCC ids) and prints one JSON object of what it changed, with old values and deep links. Any other name runs the repo's `seed_<name>` management command.
+
 ## Startup time
 
 | Case | Time |
@@ -53,6 +55,8 @@ wtenv up [--celery] [--restart] [--reset-db] [--skip-migrate] [--json]
 wtenv info [--json]
 wtenv logs [backend|frontend|celery|redis] [-f] [-n N]
 wtenv exec -- python manage.py shell
+wtenv seed                         # list wt-env scenarios and the repo's seed_* commands
+wtenv seed <module|command> [args] # run one (scenarios live in seeds/<module>.py)
 wtenv down        # stop, keep DB
 wtenv destroy     # stop, drop DB, free ports
 wtenv ls
