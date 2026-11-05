@@ -27,6 +27,7 @@ LOCK_FILE = STATE_DIR / "envs.lock"
 TEMPLATE_STATE_FILE = STATE_DIR / "template.json"
 TEMPLATE_LOCK_FILE = STATE_DIR / "template.lock"
 CLIP_OVERLAY = Path(__file__).resolve().parent / "clip-overlay.js"
+SEEDS_DIR = Path(__file__).resolve().parent / "seeds"
 
 DEFAULTS = {
     "WTENV_MAIN_CHECKOUT": str(Path.home() / "work/moxie-link"),
@@ -875,6 +876,48 @@ def cmd_exec(args, config):
     os.execvp("docker", ["docker", "exec", "-i", names(entry)["app"], *cmd])
 
 
+def seed_scenarios():
+    scenarios = {}
+    for path in sorted(SEEDS_DIR.glob("*.py")):
+        doc = re.match(r'\s*"""(.*?)(?:\n|""")', path.read_text())
+        scenarios[path.stem] = doc.group(1).strip() if doc else ""
+    return scenarios
+
+
+def repo_seed_commands(root):
+    return {path.stem: path.parts[-4] for path in sorted((root / "backend/src").glob("*/management/commands/seed_*.py"))}
+
+
+def cmd_seed(args, config):
+    root = worktree_root(args.path)
+    scenarios = seed_scenarios()
+    commands = repo_seed_commands(root)
+    if not args.name:
+        print("wt-env scenarios (wtenv seed <module> [options]; --help for options):")
+        for name, doc in scenarios.items():
+            print(f"  {name:<34} {doc}")
+        print("\nmoxie-link seed commands (wtenv seed <command> [args]):")
+        for name, app in commands.items():
+            print(f"  {name:<34} {app}")
+        return
+    command = args.name if args.name in commands else f"seed_{args.name}"
+    if args.name not in scenarios and command not in commands:
+        related = [name for name in commands if args.name.replace("-", "_") in name or args.name in commands[name]]
+        die(f"no seed for '{args.name}'. Related moxie-link commands: {', '.join(related) or 'none'}. "
+            f"Run `wtenv seed` for the full list, or add {SEEDS_DIR}/{args.name}.py (see skill).")
+    entry = find_entry(root)
+    if status_of(entry)["backend"] != "running":
+        die("backend is not running; run `wtenv up` first")
+    app = names(entry)["app"]
+    extra = args.args[1:] if args.args[:1] == ["--"] else args.args
+    if args.name in scenarios:
+        script = (SEEDS_DIR / f"{args.name}.py").read_text()
+        cmd = ["docker", "exec", "-i", "-e", f"WTENV_SEED_ARGS={json.dumps(extra)}",
+               "-e", f"WTENV_LOGIN_EMAIL={config['WTENV_LOGIN_EMAIL']}", app, "python", "manage.py", "shell", "--no-imports", "-v", "0"]
+        sys.exit(subprocess.run(cmd, input=script, text=True).returncode)
+    os.execvp("docker", ["docker", "exec", "-i", app, "python", "manage.py", command, *extra])
+
+
 def cmd_template(args, config):
     with file_lock(TEMPLATE_LOCK_FILE):
         if not args.migrate_only:
@@ -1032,6 +1075,12 @@ def main():
     exe = sub.add_parser("exec", help="run a command in the backend container")
     exe.add_argument("command", nargs=argparse.REMAINDER)
     exe.set_defaults(func=cmd_exec)
+
+    seed = sub.add_parser("seed", help="seed data for a module (no name: list scenarios and repo seed commands)",
+                          add_help=False)
+    seed.add_argument("name", nargs="?")
+    seed.add_argument("args", nargs=argparse.REMAINDER)
+    seed.set_defaults(func=cmd_seed)
 
     template = sub.add_parser("template", help="rebuild the template DB from the main dev DB, then migrate it")
     template.add_argument("--migrate-only", action="store_true", help="only migrate it to the main checkout")
